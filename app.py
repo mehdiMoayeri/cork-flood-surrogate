@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 import os
+import io
 import json
 import time
+import requests
 import numpy as np
 import pandas as pd
 import onnxruntime as ort
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import streamlit as st
 
 st.set_page_config(
@@ -20,6 +23,21 @@ BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 DATA_DIR   = os.path.join(BASE_DIR, "data")
 
+# ۸ ایستگاه واقعی کریدور رودخانه Lee و بندر کورک (مرتب از غرب به شرق)
+OPW_CORRIDOR_STATIONS = [
+    ("19102", "Waterworks Weir",          "Upstream Boundary"),
+    ("19113", "County Hall",              "Upper Split / South"),
+    ("19162", "Fitzgerald's Park",        "Weir Transition"),
+    ("19164", "Mercy Hospital",           "Interior (North Ch.)"),
+    ("19163", "Pope's Quay",              "City Centre (North)"),
+    ("19161", "St Patrick's Quay (East)", "City Centre (East)"),
+    ("19160", "Currach Club",             "Lower Tidal Reach"),
+    ("19167", "Tivoli Docks",             "Downstream Boundary"),
+]
+
+# -------------------------------------------------------------------------
+# بارگذاری هسته مدل امولاتور و لایه‌های ثابت (کش دائمی روی سرور)
+# -------------------------------------------------------------------------
 @st.cache_resource
 def load_core_assets():
     pkg = np.load(os.path.join(DATA_DIR, "cork_static_and_bc.npz"))
@@ -81,6 +99,86 @@ def load_test_scenario(k_sel):
         y_std  = fe[f"s_{k_sel}"].astype(np.float32)
     return y_true, y_mean, y_std
 
+# -------------------------------------------------------------------------
+# توابع پایش زنده OPW waterlevel.ie و تفکیک هارمونیک خیزاب (کش ۱۵ دقیقه‌ای)
+# -------------------------------------------------------------------------
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_opw_latest_table():
+    url = "https://waterlevel.ie/geojson/latest/"
+    hdr = {"User-Agent": "Mozilla/5.0 (CorkFloodSurrogateDashboard/2.0)"}
+    r = requests.get(url, headers=hdr, timeout=20)
+    r.raise_for_status()
+    feats = r.json().get("features", [])
+
+    ref_meta = {ref: (name, role, idx) for idx, (ref, name, role) in enumerate(OPW_CORRIDOR_STATIONS)}
+    found = {}
+    for ft in feats:
+        pr = ft.get("properties", {})
+        ref_raw = str(pr.get("station_ref") or pr.get("ref") or "").lstrip("0")
+        sensor  = str(pr.get("sensor_ref") or pr.get("sensor") or "")
+        if ref_raw in ref_meta and sensor == "OD":
+            coords = (ft.get("geometry") or {}).get("coordinates", [np.nan, np.nan])
+            found[ref_raw] = {
+                "order": ref_meta[ref_raw][2],
+                "Station ID": ref_raw,
+                "Station Name": ref_meta[ref_raw][0],
+                "Model Role": ref_meta[ref_raw][1],
+                "Latest Stage (mOD Malin)": pr.get("value"),
+                "Timestamp (UTC)": str(pr.get("datetime") or "").replace("T", " ").replace("Z", ""),
+                "Lat": round(float(coords[1]), 5) if len(coords) >= 2 else np.nan,
+                "Lon": round(float(coords[0]), 5) if len(coords) >= 2 else np.nan,
+                "csv_file": str(pr.get("csv_file") or f"/data/month/{ref_raw}_OD.csv"),
+            }
+    if not found:
+        return pd.DataFrame()
+    return pd.DataFrame(found.values()).sort_values("order").drop(columns=["order"]).reset_index(drop=True)
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_opw_month_series(ref_id, csv_rel_path=""):
+    if csv_rel_path and csv_rel_path.startswith("http"):
+        url = csv_rel_path
+    elif csv_rel_path and csv_rel_path.startswith("/"):
+        url = "https://waterlevel.ie" + csv_rel_path
+    else:
+        url = f"https://waterlevel.ie/data/month/{ref_id}_OD.csv"
+
+    hdr = {"User-Agent": "Mozilla/5.0 (CorkFloodSurrogateDashboard/2.0)"}
+    r = requests.get(url, headers=hdr, timeout=20)
+    r.raise_for_status()
+    df = pd.read_csv(io.StringIO(r.text))
+    df.columns = [c.strip().lower() for c in df.columns]
+    dt  = pd.to_datetime(df.iloc[:, 0], utc=True, errors="coerce")
+    val = pd.to_numeric(df.iloc[:, 1], errors="coerce")
+    s = pd.Series(val.values, index=dt, name=ref_id).dropna().sort_index()
+    s = s[~s.index.duplicated(keep="last")]
+    # هم‌گام‌سازی ۱۵ دقیقه‌ای برای هم‌ترازی دقیق ایستگاه‌ها و سرعت ترسیم
+    return s.resample("15min").mean().interpolate(limit=4)
+
+def harmonic_tide_decompose_8c(series_od):
+    """جداسازی مد نجومی و خیزاب توفانی با ۸ مؤلفه اصلی (M2, S2, N2, K2, K1, O1, P1, M4)"""
+    s_clean = series_od.dropna()
+    periods_hr = np.array([
+        12.4206012, 12.0000000, 12.6583482, 11.9672361,
+        23.9344696, 25.8193417, 24.0658902,  6.2103006
+    ])
+    omegas = 2.0 * np.pi / periods_hr
+    t_h = (s_clean.index - s_clean.index[0]).total_seconds().values / 3600.0
+    y = s_clean.values.astype(np.float64)
+
+    cols = [np.ones_like(t_h)]
+    for w in omegas:
+        cols.append(np.cos(w * t_h))
+        cols.append(np.sin(w * t_h))
+    A = np.column_stack(cols)
+    coef, *_ = np.linalg.lstsq(A, y, rcond=None)
+    tide_astro = pd.Series(A @ coef, index=s_clean.index, name="tide_astro")
+    surge_res  = pd.Series(y - tide_astro.values, index=s_clean.index, name="storm_surge")
+    r2 = float(1.0 - np.var(surge_res) / max(np.var(y), 1e-9))
+    return tide_astro, surge_res, r2
+
+# -------------------------------------------------------------------------
+# توابع شبیه‌ساز What-If و استنتاج ONNX
+# -------------------------------------------------------------------------
 def gamma_pulse(t, t_peak, width_hr, skewness=3.0):
     u = np.clip((t - (t_peak - width_hr)) / max(width_hr, 1e-3), 0.0, None)
     return np.where(u > 0, (u ** skewness) * np.exp(skewness * (1.0 - u)), 0.0)
@@ -185,19 +283,24 @@ def run_onnx_forecast(bc_121, x_init, assets, step_stride=2, n_members=3, progre
             std_48[k]  = (1 - w) * std_sel[pos - 1]  + w * std_sel[pos]
     return mean_48, std_48
 
+# -------------------------------------------------------------------------
+# رابط کاربری اصلی (۴ تب)
+# -------------------------------------------------------------------------
 assets  = load_core_assets()
 fp_mask = assets["floodplain_mask"]
 ext     = assets["extent_km"]
 
 st.title("🌊 Cork City 48h Compound Flood Surrogate Dashboard")
-st.caption("Emulating HEC-RAS 7.0.2 (20m Sub-grid) via 3-Member Deep Ensemble (2D U-Net + Causal TCN/FiLM + Hurdle Head) | Active Learning v2 (79 Scenarios)")
+st.caption("Emulating HEC-RAS 7.0.2 (20m Sub-grid) via 3-Member Deep Ensemble (2D U-Net + Causal TCN/FiLM + Hurdle Head) | Active Learning v2 (79 Scenarios) + Live OPW Telemetry")
 
-tab_live, tab_bench, tab_eval = st.tabs([
+tab_live, tab_bench, tab_eval, tab_opw = st.tabs([
     "⚡ Live What-If Forecaster (ONNX CPU)",
     "🎯 Benchmark Verification (vs. HEC-RAS)",
     "📊 Model Progression & Metrics",
+    "📡 Live OPW Telemetry & Surge (River Lee)",
 ])
 
+# === تب ۱: شبیه‌ساز تعاملی What-If ===
 with tab_live:
     c_ctrl, c_view = st.columns([1.05, 2.35])
     with c_ctrl:
@@ -316,6 +419,7 @@ with tab_live:
         else:
             st.info("Select a storm preset or adjust sliders on the left, then click **Run 48h Surrogate Forecast**.")
 
+# === تب ۲: مقایسه با ۱۰ سناریوی آزمون HEC-RAS ===
 with tab_bench:
     st.subheader("Instant Verification on Frozen 10-Scenario Test Set (Zero Latency)")
     df_ens   = pd.read_csv(os.path.join(DATA_DIR, "m1_v2_ensemble_test_metrics.csv"))
@@ -381,6 +485,7 @@ with tab_bench:
     st.pyplot(fig_ts)
     plt.close(fig_ts)
 
+# === تب ۳: جدول پیشرفت مدل‌ها ===
 with tab_eval:
     st.subheader("Controlled Progression on Frozen 10-Scenario Test Set")
     prog_df = pd.DataFrame({
@@ -401,3 +506,140 @@ with tab_eval:
     st.subheader("Per-Scenario Test Breakdown (M1-v2 3-Member Ensemble)")
     df_ens = pd.read_csv(os.path.join(DATA_DIR, "m1_v2_ensemble_test_metrics.csv"))
     st.dataframe(df_ens, use_container_width=True, hide_index=True)
+
+# === تب ۴: پایش زنده ۸ ایستگاه واقعی OPW و تفکیک هارمونیک خیزاب ===
+with tab_opw:
+    hdr_l, hdr_r = st.columns([3.2, 1.0])
+    with hdr_l:
+        st.subheader("Live OPW Hydrometric Corridor (Waterworks Weir → Tivoli Docks)")
+        st.caption("Real-time 15-minute telemetry from OPW waterlevel.ie (OD Malin datum) with 8-constituent harmonic surge decomposition.")
+    with hdr_r:
+        if st.button("🔄 Refresh OPW Feed", use_container_width=True):
+            fetch_opw_latest_table.clear()
+            fetch_opw_month_series.clear()
+            st.rerun()
+
+    try:
+        with st.spinner("Connecting to OPW waterlevel.ie live telemetry..."):
+            df_latest = fetch_opw_latest_table()
+
+        if df_latest.empty:
+            st.warning("Connected to waterlevel.ie, but no OD Malin readings were returned for the 8 Cork corridor gauges.")
+        else:
+            # انتخاب پنجره زمانی نمایش (تحلیل هارمونیک همیشه روی کل ۳۰ روز انجام می‌شود)
+            win_days = st.radio("Display Window (Harmonic Fit Always Uses Full 30-Day Record)",
+                                [3, 7, 14, 30], index=1, horizontal=True, format_func=lambda d: f"Last {d} Days")
+
+            csv_map = dict(zip(df_latest["Station ID"], df_latest["csv_file"]))
+            core_refs = ["19102", "19162", "19164", "19161", "19160", "19167"]
+            ts_map = {}
+            with st.spinner("Downloading 30-day OD Malin time series & running harmonic surge decomposition..."):
+                for r_id in core_refs:
+                    try:
+                        ts_map[r_id] = fetch_opw_month_series(r_id, csv_map.get(r_id, ""))
+                    except Exception:
+                        pass
+
+            # ساخت سری جزرومدی ترمیم‌شده برای تیولی (رفع بریدگی کف سنسور <= -0.92 mOD با کمک Currach Club)
+            tidal_src_label = ""
+            n_repaired_hrs  = 0.0
+            s_twl_full = None
+
+            if "19167" in ts_map and "19160" in ts_map:
+                df_pair = pd.concat({"tiv": ts_map["19167"], "cur": ts_map["19160"]}, axis=1).dropna(how="all")
+                s_tiv = df_pair["tiv"]
+                s_cur = df_pair["cur"]
+                clipped = (s_tiv <= -0.92) | s_tiv.isna()
+                valid_both = (~clipped) & s_tiv.notna() & s_cur.notna()
+                off_m = float(np.median(s_tiv[valid_both] - s_cur[valid_both])) if valid_both.any() else 0.0
+                s_twl_full = s_tiv.where(~clipped, s_cur + off_m).dropna()
+                n_repaired_hrs = float(clipped.sum() * 0.25)
+                tidal_src_label = f"19167 Tivoli Docks (low-tide sensor floor repaired via 19160 Currach Club, offset={off_m:+.3f} m)"
+            elif "19160" in ts_map:
+                s_twl_full = ts_map["19160"]
+                tidal_src_label = "19160 Currach Club (Lower Tidal Reach)"
+            elif "19167" in ts_map:
+                s_twl_full = ts_map["19167"]
+                tidal_src_label = "19167 Tivoli Docks (Raw)"
+
+            # محاسبه تفکیک هارمونیک ۸ مؤلفه روی کل ۳۰ روز و برش پنجره نمایش
+            if s_twl_full is not None and len(s_twl_full) > 96:
+                s_tide_full, s_surge_full, r2_tide = harmonic_tide_decompose_8c(s_twl_full)
+                t_max_all = s_twl_full.index.max()
+                t_cut = t_max_all - pd.Timedelta(days=int(win_days))
+
+                s_twl_w   = s_twl_full.loc[t_cut:]
+                s_tide_w  = s_tide_full.loc[t_cut:]
+                s_surge_w = s_surge_full.loc[t_cut:]
+
+                ww_val = df_latest.loc[df_latest["Station ID"] == "19102", "Latest Stage (mOD Malin)"]
+                ww_now = f"{float(ww_val.iloc[0]):.2f} mOD" if len(ww_val) > 0 and pd.notna(ww_val.iloc[0]) else "N/A"
+                twl_now = f"{float(s_twl_w.iloc[-1]):.2f} mOD"
+                srg_now = float(s_surge_w.iloc[-1])
+                srg_pk  = float(s_surge_w.max())
+                srg_pk_t = s_surge_w.idxmax().strftime("%b %d %H:%M UTC")
+
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Upstream: Waterworks (19102)", ww_now)
+                k2.metric("Harbour TWL (Latest)", twl_now, f"Max {win_days}d: {s_twl_w.max():.2f} mOD")
+                k3.metric("Current Surge Residual", f"{srg_now:+.2f} m", f"Harmonic R² = {r2_tide:.3f}")
+                k4.metric(f"Peak Surge (Last {win_days}d)", f"{srg_pk:+.2f} m", srg_pk_t)
+
+                # نمودار ۳ پنلی زنده (بالادست + مد و مد نجومی + خیزاب استخراج‌شده)
+                fig_opw, axes_o = plt.subplots(3, 1, figsize=(13.5, 7.6), sharex=True)
+
+                # پنل ۱: تراز رودخانه بالادست و انتقال شهری
+                if "19102" in ts_map:
+                    s_ww = ts_map["19102"].loc[t_cut:]
+                    axes_o[0].plot(s_ww.index, s_ww.values, color="#1e3a8a", lw=1.8, label="19102 Waterworks Weir (Upstream)")
+                if "19162" in ts_map:
+                    s_fp = ts_map["19162"].loc[t_cut:]
+                    axes_o[0].plot(s_fp.index, s_fp.values, color="#7c3aed", lw=1.4, label="19162 Fitzgerald's Park (Weir Transition)")
+                if "19164" in ts_map:
+                    s_mh = ts_map["19164"].loc[t_cut:]
+                    axes_o[0].plot(s_mh.index, s_mh.values, color="#059669", lw=1.1, alpha=0.8, label="19164 Mercy Hospital (Interior)")
+                axes_o[0].set_ylabel("Stage (mOD)")
+                axes_o[0].set_title(f"Live River Lee Corridor & Cork Harbour Surge Decomposition (Last {win_days} Days, UTC)")
+                axes_o[0].legend(loc="upper right", ncol=3, fontsize=8.2)
+                axes_o[0].grid(True, alpha=0.3)
+
+                # پنل ۲: تراز کل بندر کورک در برابر مد نجومی ۸ مؤلفه
+                axes_o[1].plot(s_twl_w.index, s_twl_w.values, color="crimson", lw=1.4, label="Observed TWL (Repaired)")
+                axes_o[1].plot(s_tide_w.index, s_tide_w.values, color="#2563eb", lw=1.0, ls="--", alpha=0.85,
+                               label="Astronomical Tide (8 Constituents: M2,S2,N2,K2,K1,O1,P1,M4)")
+                axes_o[1].axhline(2.50, color="crimson", ls=":", lw=0.9, alpha=0.6, label="Cork Flood Alert Ref (~2.5 mOD)")
+                axes_o[1].set_ylabel("TWL (mOD Malin)")
+                axes_o[1].legend(loc="upper right", fontsize=8.0)
+                axes_o[1].grid(True, alpha=0.3)
+
+                # پنل ۳: خیزاب توفانی غیرجزرومدی
+                axes_o[2].fill_between(s_surge_w.index, 0, s_surge_w.values, where=s_surge_w.values >= 0,
+                                       color="#ef4444", alpha=0.45, label="Positive Storm Surge")
+                axes_o[2].fill_between(s_surge_w.index, 0, s_surge_w.values, where=s_surge_w.values < 0,
+                                       color="#3b82f6", alpha=0.35, label="Negative Surge (High Pressure)")
+                axes_o[2].axhline(0.0, color="black", lw=0.8)
+                axes_o[2].scatter([s_surge_w.idxmax()], [srg_pk], color="#991b1b", s=35, zorder=5)
+                axes_o[2].annotate(f"Peak {srg_pk:+.2f} m ({srg_pk_t})",
+                                   xy=(s_surge_w.idxmax(), srg_pk), xytext=(8, 4),
+                                   textcoords="offset points", fontsize=8.2, fontweight="bold", color="#991b1b")
+                axes_o[2].set_ylabel("Surge Residual (m)")
+                axes_o[2].set_xlabel("Date / Time (UTC)")
+                axes_o[2].legend(loc="upper right", fontsize=8.2)
+                axes_o[2].grid(True, alpha=0.3)
+                axes_o[2].xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+
+                plt.tight_layout()
+                st.pyplot(fig_opw)
+                plt.close(fig_opw)
+
+                if n_repaired_hrs > 0:
+                    st.caption(f"QA/QC Note: {tidal_src_label}. Across the 30-day archive, {n_repaired_hrs:.1f} h of low-tide sensor clipping (≤ -0.92 mOD) were seamlessly patched.")
+            else:
+                st.info("Tidal time series temporarily unavailable for harmonic decomposition; displaying latest snapshots below.")
+
+            st.markdown("#### Current Snapshot — All 8 Corridor Stations (West → East)")
+            show_cols = ["Station ID", "Station Name", "Model Role", "Latest Stage (mOD Malin)", "Timestamp (UTC)", "Lat", "Lon"]
+            st.dataframe(df_latest[show_cols], use_container_width=True, hide_index=True)
+
+    except Exception as e:
+        st.warning(f"⚠️ Could not reach OPW waterlevel.ie right now ({type(e).__name__}: {e}). Tabs 1–3 continue operating offline normally.")
